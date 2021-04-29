@@ -2,7 +2,6 @@ package httpcat
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -18,18 +17,54 @@ import (
 	"github.com/ainiaa/catutil"
 )
 
+type RequestData struct {
+	Method      string            // http.MethodPost http.MethodGet ...
+	Header      map[string]string // header 信息
+	KVData      map[string]string // data 数据
+	RequestBody string
+	ClientConf  HttpClientConf
+}
+
+func GetWithCat(ctx context.Context, uri string, data *RequestData) (res []byte) {
+	if data == nil {
+		data = &RequestData{
+			Method: http.MethodGet,
+			ClientConf: c,
+		}
+	} else {
+		data.Method = http.MethodGet
+	}
+	return RequestWithCat(ctx, uri, data)
+}
+
+func PostWithCat(ctx context.Context, uri string, data *RequestData) (res []byte) {
+	if data == nil {
+		data = &RequestData{
+			Method: http.MethodPost,
+		}
+	} else {
+		data.Method = http.MethodPost
+	}
+	return RequestWithCat(ctx, uri, data)
+}
+
 /**
  * 这个方法会返回*http.Response，理论上如果不用，处理方应该手动close掉
  */
-func RequestWithCat(ctx context.Context, urlRaw string, method string,
-	data string, header map[string]string, timeout int64, mapData map[string]string) (re []byte) {
+func RequestWithCat(ctx context.Context, urlRaw string, data *RequestData) (re []byte) {
+	var method = data.Method
+	var header = data.Header
+	var timeout = data.ClientConf.ReadWriteTimeoutMS
+	var kvData = data.KVData
 	if !cat.IsEnabled() {
-		if len(mapData) > 0 {
-			return RequestUrlencoded(ctx, urlRaw, method, mapData, header, timeout)
+		if len(kvData) > 0 {
+			return RequestUrlencoded(ctx, urlRaw, method, kvData, header, int64(timeout))
 		}
-		return Request(ctx, urlRaw, method, data, header, timeout)
+		return Request(ctx, urlRaw, method, data.RequestBody, header, int64(timeout))
+
 	}
 	var tran message.Transactor
+
 	u, err := url.Parse(urlRaw)
 	if ctx == nil {
 		ctx = context.Background()
@@ -54,12 +89,15 @@ func RequestWithCat(ctx context.Context, urlRaw string, method string,
 	default:
 		ctx = context.WithValue(ctx, catutil.CatCtxHttpRemoteTran, tran)
 	}
-	re = request(ctx, urlRaw, method, data, header, timeout, mapData)
+	re = request(ctx, urlRaw, data)
 	return
 }
 
-func request(ctx context.Context, uri string, method string,
-	data string, header map[string]string, timeout int64, mapData map[string]string) (re []byte) {
+func request(ctx context.Context, uri string, reqData *RequestData) (re []byte) {
+	var method = reqData.Method
+	var header = reqData.Header
+	var kvData = reqData.KVData
+	var data = reqData.RequestBody
 	if method == "" {
 		method = http.MethodPost
 	}
@@ -76,9 +114,9 @@ func request(ctx context.Context, uri string, method string,
 		}
 	}
 	var reqBody io.Reader
-	if header["Content-Type"] == "application/x-www-form-urlencoded" && mapData != nil {
+	if header["Content-Type"] == "application/x-www-form-urlencoded" && kvData != nil {
 		dataUrlVal := url.Values{}
-		for key, val := range mapData {
+		for key, val := range kvData {
 			dataUrlVal.Add(key, val)
 		}
 		reqBody = strings.NewReader(dataUrlVal.Encode())
@@ -107,13 +145,7 @@ func request(ctx context.Context, uri string, method string,
 	if req.Header.Get("Content-Type") == "" {
 		req.Header.Add("Content-Type", "application/json")
 	}
-	if timeout == 0 {
-		//默认超时2000ms
-		timeout = 2000
-	}
-	clt := http.Client{
-		Timeout: time.Duration(timeout) * time.Millisecond,
-	}
+	clt := NewHttpClient(reqData.ClientConf)
 	resp, err := clt.Do(req)
 	if err != nil {
 		if tran != nil && cat.IsEnabled() {
@@ -122,7 +154,12 @@ func request(ctx context.Context, uri string, method string,
 		}
 		return re
 	}
-	body, err := ioutil.ReadAll(resp.Body)
+	if reqData.ClientConf.BodyReadTimeoutMS == 0 {
+		re, err = ioutil.ReadAll(resp.Body)
+	} else {
+		re, err = readAllWithTimout(resp, reqData.ClientConf)
+	}
+
 	if err != nil {
 		if tran != nil && cat.IsEnabled() {
 			tran.AddData(catutil.RemoteCallErr, err.Error())
@@ -146,25 +183,29 @@ func request(ctx context.Context, uri string, method string,
 	if resp != nil && resp.Body != nil {
 		_ = resp.Body.Close()
 	}
-	return body
+	return
 }
 
-type Resp struct {
-	Code int         `json:"code"`
-	Msg  string      `json:"msg"`
-	Data interface{} `json:"data"`
-}
+func readAllWithTimout(resp *http.Response, cc HttpClientConf) (body []byte, err error) {
+	if resp.StatusCode == http.StatusOK { // 请求成功
+		bodyReadTimeoutMS := 3000
+		if cc.BodyReadTimeoutMS > 0 {
+			bodyReadTimeoutMS = cc.BodyReadTimeoutMS
+		}
 
-func GetBody(req string) *Resp {
-	r := &Resp{}
-	_ = json.Unmarshal([]byte(req), &r)
-	return r
-}
-
-func PostWithTime(ctx context.Context, url string, data string, timeout int64) (re []byte) {
-	re = RequestWithCat(ctx, url, http.MethodPost, data, map[string]string{
-		"Content-Type":            "application/json",
-		catutil.TraceIdHeaderName: catutil.GetTraceId(ctx),
-	}, timeout, nil)
-	return re
+		ctx, _ := context.WithTimeout(context.Background(), time.Duration(bodyReadTimeoutMS)*time.Millisecond)
+		finish := make(chan struct{}, 1)
+		go func() {
+			body, err = ioutil.ReadAll(resp.Body)
+			finish <- struct{}{}
+		}()
+		select {
+		case <-ctx.Done(): // read body 超时
+			return body, fmt.Errorf("readBody timeout bodyReadTimeoutMS:%d error", bodyReadTimeoutMS)
+		case <-finish: // 正常获取返回值
+			return
+		}
+	} else {
+		return nil, nil
+	}
 }
