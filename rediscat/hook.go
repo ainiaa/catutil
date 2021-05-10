@@ -7,9 +7,9 @@ import (
 	"github.com/cat-go/cat"
 	"github.com/cat-go/cat/message"
 	"github.com/gin-gonic/gin"
-	"github.com/go-redis/redis/v7"
+	"github.com/go-redis/redis/v8"
 
-	"github.com/ainiaa/catutil"
+	"github.com/ainiaa/catutil/v2"
 )
 
 type RedisTraceHook struct {
