@@ -18,17 +18,18 @@ import (
 )
 
 type RequestData struct {
-	Method      string            // http.MethodPost http.MethodGet ...
-	Header      map[string]string // header 信息
-	KVData      map[string]string // data 数据
-	RequestBody string
-	ClientConf  HttpClientConf
+	Method          string            // http.MethodPost http.MethodGet ...
+	Header          map[string]string // header 信息
+	KVData          map[string]string // data 数据
+	UseOriginHeader bool              // 设置为 true 的话，不再使用 golang 自动格式化 header
+	RequestBody     string
+	ClientConf      HttpClientConf
 }
 
 func GetWithCat(ctx context.Context, uri string, data *RequestData) (res []byte) {
 	if data == nil {
 		data = &RequestData{
-			Method: http.MethodGet,
+			Method:     http.MethodGet,
 			ClientConf: c,
 		}
 	} else {
@@ -132,9 +133,16 @@ func request(ctx context.Context, uri string, reqData *RequestData) (re []byte) 
 		return re
 	}
 	defer req.Body.Close()
-	for k, v := range header {
-		req.Header.Add(k, v)
+	if reqData.UseOriginHeader {
+		for k, v := range header {
+			req.Header[k] =  []string{v}
+		}
+	} else {
+		for k, v := range header {
+			req.Header.Add(k, v)
+		}
 	}
+
 	if tran != nil && cat.IsEnabled() {
 		childId := cat.MessageId()
 		tran.LogEvent(cat.TypeRemoteCall, "rpc remote", cat.SUCCESS, childId)
